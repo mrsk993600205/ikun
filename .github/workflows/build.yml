@@ -5,6 +5,9 @@ on:
     tags: ['v*']
   workflow_dispatch:
 
+env:
+  TAURI_SIGNING_PRIVATE_KEY: ''
+
 jobs:
   macos:
     runs-on: macos-latest
