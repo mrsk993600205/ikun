@@ -1,0 +1,365 @@
+use lofty::config::WriteOptions;
+use lofty::file::{AudioFile, TaggedFileExt};
+use lofty::tag::{Accessor, ItemKey, ItemValue, Tag, TagType};
+use std::path::Path;
+use std::time::SystemTime;
+use walkdir::WalkDir;
+use crate::db::music_db::{self, TrackRow, TrackStat};
+
+const AUDIO_EXTENSIONS: &[&str] = &["mp3", "flac", "wav", "ogg", "m4a", "aac", "wma", "opus", "ape", "alac"];
+
+fn is_audio_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| AUDIO_EXTENSIONS.contains(&e.to_lowercase().as_str()))
+        .unwrap_or(false)
+}
+
+fn read_sidecar_lrc(path: &Path) -> Option<String> {
+    let stem = path.file_stem()?.to_string_lossy();
+    let dir = path.parent()?;
+    let lrc_path = dir.join(format!("{}.lrc", stem));
+    let bytes = std::fs::read(&lrc_path).ok().filter(|b| !b.is_empty())?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+fn default_tag_type(path: &Path) -> TagType {
+    match path.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase()) {
+        Some(ext) if ext == "mp3" => TagType::Id3v2,
+        Some(ext) if ext == "m4a" || ext == "mp4" || ext == "aac" || ext == "alac" => TagType::Mp4Ilst,
+        Some(ext) if ext == "wav" => TagType::RiffInfo,
+        _ => TagType::VorbisComments,
+    }
+}
+
+fn ensure_primary_tag<'a>(tagged_file: &'a mut lofty::file::TaggedFile, path: &Path) -> Result<&'a mut Tag, String> {
+    if tagged_file.primary_tag().is_none() {
+        tagged_file.insert_tag(Tag::new(default_tag_type(path)));
+    }
+    tagged_file.primary_tag_mut().ok_or_else(|| "No tag found".to_string())
+}
+
+pub fn read_lyrics_from_file(path: &Path) -> Option<String> {
+    if let Ok(tagged_file) = lofty::read_from_path(path) {
+        if let Some(lrc) = tagged_file.primary_tag()
+            .and_then(|t| t.get_string(&ItemKey::Lyrics).map(|s| s.to_owned()))
+            .filter(|s: &String| !s.trim().is_empty())
+        {
+            return Some(lrc);
+        }
+    }
+    read_sidecar_lrc(path)
+}
+
+fn read_tags(path: &Path) -> Option<TrackRow> {
+    let tagged_file = lofty::read_from_path(path).ok()?;
+    let properties = tagged_file.properties();
+    let tag = tagged_file.primary_tag();
+
+    let file_name = path.file_stem()?.to_string_lossy().to_string();
+    let (singer, name, album_name, year, has_cover) = match tag {
+        Some(t) => (
+            t.artist().map(|s| s.to_string()).unwrap_or_default(),
+            t.title().map(|s| s.to_string()).unwrap_or_else(|| file_name.clone()),
+            t.album().map(|s| s.to_string()).unwrap_or_default(),
+            t.year().unwrap_or(0) as i64,
+            t.pictures().first().is_some(),
+        ),
+        None => (String::new(), file_name.clone(), String::new(), 0, false),
+    };
+    let duration = properties.duration().as_secs_f64();
+    let bitrate = properties.audio_bitrate().unwrap_or(0) as i64;
+    let sample_rate = properties.sample_rate().unwrap_or(0) as i64;
+    let channels = properties.channels().unwrap_or(0) as i64;
+
+    let mtime_ms = path.metadata()
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+
+    let file_size = path.metadata().map(|m| m.len() as i64).unwrap_or(0);
+
+    let songmid = format!("local_{}", md5_hash(path.to_string_lossy().as_bytes()));
+
+    // Read lyrics from tag, fall back to sidecar .lrc file
+    let lrc = tag
+        .and_then(|t| t.get_string(&ItemKey::Lyrics).map(|s| s.to_owned()))
+        .filter(|s: &String| !s.trim().is_empty())
+        .or_else(|| read_sidecar_lrc(path));
+
+    Some(TrackRow {
+        songmid,
+        path: path.to_string_lossy().to_string(),
+        url: None,
+        singer,
+        name,
+        album_name,
+        album_id: 0,
+        source: "local".to_string(),
+        interval: format_duration(duration),
+        has_cover: if has_cover { 1 } else { 0 },
+        cover_key: None,
+        year,
+        lrc,
+        types: "[]".to_string(),
+        _types: "{}".to_string(),
+        type_url: "{}".to_string(),
+        bitrate,
+        sample_rate,
+        channels,
+        duration,
+        size: file_size,
+        mtime_ms,
+        hash: None,
+        updated_at: chrono::Utc::now().timestamp(),
+    })
+}
+
+fn md5_hash(data: &[u8]) -> String {
+    // Simple hash for generating unique IDs (not cryptographic)
+    let mut hash: u64 = 5381;
+    for &byte in data {
+        hash = hash.wrapping_mul(33).wrapping_add(byte as u64);
+    }
+    format!("{:016x}", hash)
+}
+
+fn format_duration(secs: f64) -> String {
+    let total_secs = secs as u64;
+    let min = total_secs / 60;
+    let sec = total_secs % 60;
+    format!("{:02}:{:02}", min, sec)
+}
+
+pub struct ScanResult {
+    pub scanned: usize,
+    pub added: usize,
+    pub updated: usize,
+    pub errors: usize,
+}
+
+fn is_hidden(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| n.starts_with('.'))
+        .unwrap_or(false)
+}
+
+pub fn scan_directories(conn: &rusqlite::Connection, dirs: &[String], skip_hidden: bool) -> ScanResult {
+    let mut result = ScanResult { scanned: 0, added: 0, updated: 0, errors: 0 };
+
+    // Get existing stats for incremental scan
+    let existing_stats: Vec<TrackStat> = music_db::get_all_stats(conn).unwrap_or_default();
+    let stat_map: std::collections::HashMap<String, TrackStat> = existing_stats
+        .into_iter()
+        .map(|s| (s.path.clone(), s))
+        .collect();
+
+    let mut new_tracks: Vec<TrackRow> = Vec::new();
+    let mut found_paths: Vec<String> = Vec::new();
+
+    for dir in dirs {
+        let walker = WalkDir::new(dir).into_iter().filter_entry(|e| {
+            if !skip_hidden { return true; }
+            !is_hidden(e.path())
+        });
+        for entry in walker.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if !path.is_file() || !is_audio_file(path) { continue; }
+
+            result.scanned += 1;
+            let path_str = path.to_string_lossy().to_string();
+            found_paths.push(path_str.clone());
+
+            // Check mtime for incremental update
+            let mtime_ms = path.metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+
+            if let Some(existing) = stat_map.get(&path_str) {
+                if existing.mtime_ms == mtime_ms { continue; } // Unchanged
+            }
+
+            match read_tags(path) {
+                Some(track) => new_tracks.push(track),
+                None => {
+                    // Fallback: create a basic track entry when tag parsing fails
+                    let file_name = path.file_stem()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "Unknown".to_string());
+                    let mtime_ms_fallback = path.metadata()
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+                        .map(|d| d.as_millis() as i64)
+                        .unwrap_or(0);
+                    let file_size_fallback = path.metadata().map(|m| m.len() as i64).unwrap_or(0);
+                    let songmid_fallback = format!("local_{}", md5_hash(path.to_string_lossy().as_bytes()));
+                    new_tracks.push(TrackRow {
+                        songmid: songmid_fallback,
+                        path: path.to_string_lossy().to_string(),
+                        url: None,
+                        singer: String::new(),
+                        name: file_name,
+                        album_name: String::new(),
+                        album_id: 0,
+                        source: "local".to_string(),
+                        interval: String::new(),
+                        has_cover: 0,
+                        cover_key: None,
+                        year: 0,
+                        lrc: None,
+                        types: "[]".to_string(),
+                        _types: "{}".to_string(),
+                        type_url: "{}".to_string(),
+                        bitrate: 0,
+                        sample_rate: 0,
+                        channels: 0,
+                        duration: 0.0,
+                        size: file_size_fallback,
+                        mtime_ms: mtime_ms_fallback,
+                        hash: None,
+                        updated_at: chrono::Utc::now().timestamp(),
+                    });
+                    result.errors += 1;
+                }
+            }
+        }
+    }
+
+    // Batch upsert new/changed tracks
+    if !new_tracks.is_empty() {
+        result.added = new_tracks.len();
+        let _ = music_db::upsert_tracks(conn, &new_tracks);
+    }
+
+    // Prune tracks that are no longer in scan directories
+    let _ = music_db::prune_outside_keep(conn, &found_paths);
+
+    result
+}
+
+pub fn get_cover_data(path: &Path) -> Option<Vec<u8>> {
+    let tagged_file = lofty::read_from_path(path).ok()?;
+    let tag = tagged_file.primary_tag()?;
+    let picture = tag.pictures().first()?;
+    Some(picture.data().to_vec())
+}
+
+pub fn read_file_tags(path: &Path) -> Option<TrackRow> {
+    read_tags(path)
+}
+
+pub fn write_tags(path: &Path, info: &TrackRow) -> Result<(), String> {
+    let mut tagged_file = lofty::read_from_path(path).map_err(|e| e.to_string())?;
+    let tag = ensure_primary_tag(&mut tagged_file, path)?;
+
+    if tag.title().map(|v| v.trim().is_empty()).unwrap_or(true) {
+        tag.set_title(info.name.clone().into());
+    }
+    if tag.artist().map(|v| v.trim().is_empty()).unwrap_or(true) {
+        tag.set_artist(info.singer.clone().into());
+    }
+    if tag.album().map(|v| v.trim().is_empty()).unwrap_or(true) {
+        tag.set_album(info.album_name.clone().into());
+    }
+    if info.year > 0 && tag.year().is_none() {
+        tag.set_year(info.year as u32);
+    }
+
+    tagged_file.save_to_path(path, WriteOptions::default()).map_err(|e| e.to_string())
+}
+
+/// Write tags to a downloaded file with full options
+pub fn write_download_tags(
+    path: &Path,
+    song_info: &serde_json::Value,
+    tag_options: &serde_json::Value,
+    cover_data: Option<&[u8]>,
+    lyrics: Option<&str>,
+) -> Result<(), String> {
+    let mut tagged_file = lofty::read_from_path(path).map_err(|e| e.to_string())?;
+    let tag = ensure_primary_tag(&mut tagged_file, path)?;
+
+    let basic = tag_options.get("basicInfo").and_then(|v| v.as_bool()).unwrap_or(true);
+    if basic {
+        if let Some(name) = song_info.get("name").and_then(|v| v.as_str()) {
+            if tag.title().map(|v| v.trim().is_empty()).unwrap_or(true) {
+                tag.set_title(name.to_string().into());
+            }
+        }
+        if let Some(singer) = song_info.get("singer").and_then(|v| v.as_str()) {
+            if tag.artist().map(|v| v.trim().is_empty()).unwrap_or(true) {
+                tag.set_artist(singer.to_string().into());
+            }
+        }
+        if let Some(album) = song_info.get("albumName").and_then(|v| v.as_str()) {
+            if tag.album().map(|v| v.trim().is_empty()).unwrap_or(true) {
+                tag.set_album(album.to_string().into());
+            }
+        }
+    }
+
+    let write_cover = tag_options.get("cover").and_then(|v| v.as_bool()).unwrap_or(false);
+    if write_cover {
+        if tag.pictures().is_empty() {
+            if let Some(data) = cover_data {
+                let mime_type = if data.starts_with(b"\x89PNG\r\n\x1a\n") {
+                    lofty::picture::MimeType::Png
+                } else if data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a") {
+                    lofty::picture::MimeType::Gif
+                } else if data.starts_with(b"BM") {
+                    lofty::picture::MimeType::Bmp
+                } else {
+                    lofty::picture::MimeType::Jpeg
+                };
+                let pic = lofty::picture::Picture::new_unchecked(
+                    lofty::picture::PictureType::CoverFront,
+                    Some(mime_type),
+                    None,
+                    data.to_vec(),
+                );
+                tag.push_picture(pic);
+            }
+        }
+    }
+
+    let write_lyrics = tag_options.get("lyrics").and_then(|v| v.as_bool()).unwrap_or(false);
+    if write_lyrics {
+        let has_lyrics = tag.get_string(&ItemKey::Lyrics)
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false);
+        if !has_lyrics {
+            if let Some(lrc) = lyrics {
+                if !lrc.is_empty() {
+                    tag.push(lofty::tag::TagItem::new(
+                        ItemKey::Lyrics,
+                        ItemValue::Text(lrc.to_string()),
+                    ));
+                }
+            }
+        }
+    }
+
+    tagged_file.save_to_path(path, WriteOptions::default()).map_err(|e| e.to_string())?;
+
+    // Save separate LRC file if option enabled
+    let download_lrc = tag_options.get("downloadLyrics").and_then(|v| v.as_bool()).unwrap_or(false);
+    if download_lrc {
+        if let Some(lrc) = lyrics {
+            if !lrc.is_empty() {
+                let lrc_path = path.with_extension("lrc");
+                if !lrc_path.exists() {
+                    std::fs::write(&lrc_path, lrc).map_err(|e| format!("保存歌词文件失败: {}", e))?;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}

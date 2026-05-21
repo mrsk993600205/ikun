@@ -1,0 +1,9 @@
+cd /Users/xiaofan/Desktop/Project/radio/Mio-Music-main
+source .rust/cargo/env && npm run tauri dev
+
+
+
+打包命令 apksigner sign --ks src-tauri/ikun-music.keystore \
+  --ks-pass pass:ikun123 --key-pass pass:ikun123 \
+  --out Ikun-Music-arm64.apk \
+  src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release-unsigned.apk
